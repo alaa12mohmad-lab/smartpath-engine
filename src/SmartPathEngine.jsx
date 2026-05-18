@@ -1,0 +1,1023 @@
+import { useState, useEffect, useRef } from "react";
+import { loadData, saveData } from "./firebase";
+
+// ═══════════════════════════════════════════════════════════
+//                 SMARTPATH ALGORITHM v2
+// ═══════════════════════════════════════════════════════════
+
+function calcFocusCompat(task, focusLevel) {
+  if (task.difficulty <= 3) return Math.max(0, 100 - focusLevel);
+  if (task.difficulty >= 7) return focusLevel;
+  const t = (task.difficulty - 3) / 4;
+  return (1 - t) * (100 - focusLevel) + t * focusLevel;
+}
+
+function calcScore(task, profile) {
+  const { focusLevel, energyLevel, stressLevel } = profile;
+  const focusCompat = calcFocusCompat(task, focusLevel);
+  const goalAlign = task.goalRelevance * (1 - stressLevel / 200);
+  const consistency = Math.min(100, task.completionStreak * 15);
+  const diffPenalty = task.difficulty * 10 * (1 + (100 - energyLevel) / 200);
+  return Math.round((
+    task.priority * 0.35 +
+    task.urgency * 0.25 +
+    focusCompat * 0.15 +
+    goalAlign * 0.15 +
+    consistency * 0.10 -
+    diffPenalty * 0.10
+  ) * 10) / 10;
+}
+
+function getAdaptiveRules(profile, tasks) {
+  const { focusLevel, energyLevel, stressLevel } = profile;
+  const pending = tasks.filter(t => !t.completed);
+  const rules = [];
+  if (focusLevel < 35) rules.push({ id: "fl", icon: "🧠", msg: "التركيز منخفض — المهام الصعبة مؤجلة تلقائياً", sev: "warn" });
+  if (energyLevel < 25) rules.push({ id: "ec", icon: "⚡", msg: "طاقة حرجة — يجب الراحة الآن", sev: "danger" });
+  else if (energyLevel < 45) rules.push({ id: "el", icon: "🔋", msg: "طاقة منخفضة — تقليل الحمل الوظيفي", sev: "warn" });
+  if (stressLevel > 75) rules.push({ id: "bo", icon: "🔥", msg: "خطر إرهاق — إضافة جلسات استرداد", sev: "danger" });
+  const avoided = pending.filter(t => t.postponeCount >= 3);
+  if (avoided.length) rules.push({ id: "pr", icon: "🔄", msg: `${avoided.length} مهام مؤجلة — ستُقسَّم لمراحل أصغر`, sev: "info" });
+  const urgent = pending.filter(t => t.urgency > 80);
+  if (urgent.length) rules.push({ id: "dl", icon: "⏰", msg: `${urgent.length} مهام عاجلة — إعادة ترتيب الجدول`, sev: "urgent" });
+  if (focusLevel > 75 && energyLevel > 65) rules.push({ id: "pk", icon: "🚀", msg: "حالة ذروة — ابدأ بأصعب مهمة الآن!", sev: "success" });
+  return rules;
+}
+
+function burnoutRisk(p) {
+  return Math.round(p.stressLevel * 0.5 + (100 - p.energyLevel) * 0.3 + (100 - p.focusLevel) * 0.2);
+}
+
+function buildPlan(tasks, profile, hours) {
+  const fm = 0.7 + profile.focusLevel / 100 * 0.6;
+  const em = 0.8 + profile.energyLevel / 100 * 0.4;
+  const sessionLen = Math.round(Math.max(20, Math.min(90, profile.avgFocusDuration * fm * em)));
+  const breakLen = sessionLen >= 60 ? 15 : sessionLen >= 40 ? 10 : 5;
+  const total = hours * 60;
+  const queue = tasks
+    .filter(t => !t.completed)
+    .map(t => ({ ...t, score: calcScore(t, profile), left: t.estimatedMinutes }))
+    .sort((a, b) => b.score - a.score);
+  const blocks = [];
+  let used = 0, qi = 0;
+  while (used < total - 15 && qi < queue.length) {
+    const task = queue[qi];
+    if (task.left < 15) { qi++; continue; }
+    const isLast = used + sessionLen + breakLen >= total;
+    const work = Math.min(sessionLen, task.left, total - used);
+    if (work < 15) break;
+    blocks.push({ id: blocks.length, task: { ...task }, durationMin: work, breakMin: isLast ? 0 : breakLen, status: "pending" });
+    task.left -= work;
+    used += work + (isLast ? 0 : breakLen);
+    if (task.left < 15) qi++;
+  }
+  return { blocks, sessionLen, breakLen };
+}
+
+function analyzeHistory(history) {
+  if (history.length < 3) return null;
+  const avgProd = (history.reduce((s, h) => s + h.productivity, 0) / history.length).toFixed(1);
+  const byHour = {};
+  history.forEach(h => { if (!byHour[h.hour]) byHour[h.hour] = []; byHour[h.hour].push(h.productivity); });
+  const hourAvgs = Object.entries(byHour)
+    .map(([h, ps]) => ({ hour: +h, avg: ps.reduce((a, b) => a + b, 0) / ps.length }))
+    .sort((a, b) => b.avg - a.avg).slice(0, 3);
+  const completionRate = Math.round(history.filter(h => h.completed === "yes").length / history.length * 100);
+  const avgInt = (history.reduce((s, h) => s + h.interruptions, 0) / history.length).toFixed(1);
+  const good = history.filter(h => h.productivity >= 3);
+  const avgFocusActual = good.length ? Math.round(good.reduce((s, h) => s + h.plannedMin, 0) / good.length) : null;
+  return { avgProd, hourAvgs, completionRate, avgInt, avgFocusActual };
+}
+
+function fmt(s) { return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; }
+function scoreColor(s) { return s >= 65 ? "#00ff88" : s >= 40 ? "#ffa502" : "#ff4757"; }
+function diffLabel(d) { return d <= 2 ? "سهل جداً" : d <= 4 ? "خفيف" : d <= 6 ? "متوسط" : d <= 8 ? "صعب" : "متقدم"; }
+
+// ═══════════════════════════════════════════════════════════
+//                      DESIGN SYSTEM
+// ═══════════════════════════════════════════════════════════
+
+const C = { bg: "#070b12", surface: "#0d1117", card: "#0d1520", border: "#1a2640", cyan: "#00d4ff", green: "#00ff88", red: "#ff4757", orange: "#ffa502", purple: "#a78bfa", text: "#e2e8f0", muted: "#6b7280" };
+const S = {
+  card: { background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 18, marginBottom: 14 },
+  cardTitle: { fontSize: 11, fontWeight: 800, color: C.cyan, marginBottom: 14, display: "flex", alignItems: "center", gap: 7, letterSpacing: 1.2, textTransform: "uppercase" },
+  input: { background: "#131c27", border: `1px solid ${C.border}`, borderRadius: 8, padding: "9px 14px", color: C.text, fontSize: 14, width: "100%", outline: "none", fontFamily: "inherit", boxSizing: "border-box" },
+  meter: { background: "#131c27", borderRadius: 4, height: 5, overflow: "hidden", marginTop: 5 },
+  slider: { width: "100%", accentColor: C.cyan, cursor: "pointer" },
+};
+
+const BTN = {
+  primary: { background: `linear-gradient(135deg, #00d4ff, #0088bb)`, color: "#000", border: "none" },
+  success: { background: `linear-gradient(135deg, #00ff88, #00aa55)`, color: "#000", border: "none" },
+  ghost: { background: "transparent", border: `1px solid ${C.border}`, color: C.muted },
+  danger: { background: "transparent", border: `1px solid #ff475744`, color: "#ff4757" },
+  orange: { background: "transparent", border: `1px solid #ffa50244`, color: "#ffa502" },
+  cyan: { background: "transparent", border: `1px solid #00d4ff44`, color: "#00d4ff" },
+};
+
+function Btn({ v = "ghost", children, style, ...p }) {
+  return (
+    <button style={{ borderRadius: 8, padding: "8px 16px", cursor: "pointer", fontSize: 14, fontFamily: "inherit", fontWeight: 600, transition: "opacity 0.15s", ...BTN[v], ...style }} {...p}>
+      {children}
+    </button>
+  );
+}
+
+function Badge({ sev, icon, msg }) {
+  const map = { danger: C.red, warn: C.orange, urgent: "#ff6b35", info: C.cyan, success: C.green };
+  const c = map[sev] || C.cyan;
+  return (
+    <div style={{ background: `${c}15`, border: `1px solid ${c}44`, color: c, borderRadius: 7, padding: "7px 13px", fontSize: 13, display: "flex", alignItems: "center", gap: 8 }}>
+      <span style={{ fontSize: 15 }}>{icon}</span><span>{msg}</span>
+    </div>
+  );
+}
+
+function StatCard({ color, icon, val, label }) {
+  return (
+    <div style={{ background: `${color}0f`, border: `1px solid ${color}30`, borderRadius: 10, padding: 14, textAlign: "center" }}>
+      <div style={{ fontSize: 20 }}>{icon}</div>
+      <div style={{ fontSize: 18, fontWeight: 800, color, margin: "3px 0" }}>{val}</div>
+      <div style={{ fontSize: 11, color: C.muted }}>{label}</div>
+    </div>
+  );
+}
+
+function Meter({ value, color }) {
+  return (
+    <div style={S.meter}>
+      <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, value))}%`, background: color, borderRadius: 3, transition: "width 0.4s" }} />
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+//              ADD TASK FORM — standalone component
+// ═══════════════════════════════════════════════════════════
+
+const EMPTY_TASK = { title: "", priority: 70, urgency: 50, difficulty: 5, goalRelevance: 70, estimatedMinutes: 30 };
+
+function AddTaskForm({ onAdd }) {
+  const [title, setTitle] = useState("");
+  const [priority, setPriority] = useState(70);
+  const [urgency, setUrgency] = useState(50);
+  const [difficulty, setDifficulty] = useState(5);
+  const [goalRelevance, setGoalRelevance] = useState(70);
+  const [estimatedMinutes, setEstimatedMinutes] = useState(30);
+  const [debugMsg, setDebugMsg] = useState("");
+
+  const diffLabel = d => d <= 2 ? "سهل جداً" : d <= 4 ? "خفيف" : d <= 6 ? "متوسط" : d <= 8 ? "صعب" : "متقدم";
+
+  const handleAdd = () => {
+    if (!title.trim()) {
+      setDebugMsg("❌ العنوان فارغ — اكتب في الحقل أولاً");
+      return;
+    }
+    onAdd({ title: title.trim(), priority, urgency, difficulty, goalRelevance, estimatedMinutes });
+    setTitle("");
+    setPriority(70); setUrgency(50); setDifficulty(5); setGoalRelevance(70); setEstimatedMinutes(30);
+    setDebugMsg("✅ تمت الإضافة: " + title.trim());
+  };
+
+  const sliders = [
+    { label: "الأهمية", val: priority, set: setPriority, max: 100, unit: "%" },
+    { label: "الاستعجال", val: urgency, set: setUrgency, max: 100, unit: "%" },
+    { label: "أهمية للهدف", val: goalRelevance, set: setGoalRelevance, max: 100, unit: "%" },
+    { label: "المدة التقديرية", val: estimatedMinutes, set: setEstimatedMinutes, max: 240, min: 5, unit: "د" },
+  ];
+
+  return (
+    <div style={S.card}>
+      <div style={S.cardTitle}>➕ مهمة جديدة</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 11 }}>
+        <input
+          style={{ ...S.input, border: "1px solid #00d4ff88", fontSize: 15, padding: "12px 16px" }}
+          placeholder="← اكتب عنوان المهمة هنا ثم اضغط الزر"
+          value={title}
+          onInput={e => setTitle(e.target.value)}
+          onChange={e => setTitle(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && handleAdd()}
+          autoFocus
+        />
+        <div style={{ fontSize: 12, color: title ? "#00ff88" : "#ffa502", minHeight: 18, transition: "color 0.2s" }}>
+          {title ? "✏️ عنوان المهمة: " + title : "⚠️ اكتب العنوان في الحقل أعلاه أولاً"}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          {sliders.map(f => (
+            <div key={f.label}>
+              <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 3 }}>
+                {f.label}: <strong style={{ color: "#e2e8f0" }}>{f.val}{f.unit}</strong>
+              </div>
+              <input type="range" min={f.min || 0} max={f.max} value={f.val}
+                style={{ width: "100%", accentColor: "#00d4ff", cursor: "pointer" }}
+                onChange={e => f.set(+e.target.value)} />
+            </div>
+          ))}
+          <div>
+            <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 3 }}>
+              الصعوبة: <strong style={{ color: "#e2e8f0" }}>{diffLabel(difficulty)}</strong>
+            </div>
+            <input type="range" min={1} max={10} value={difficulty}
+              style={{ width: "100%", accentColor: "#00d4ff", cursor: "pointer" }}
+              onChange={e => setDifficulty(+e.target.value)} />
+          </div>
+        </div>
+        <button
+          onClick={handleAdd}
+          style={{ background: "linear-gradient(135deg,#00ff88,#00aa55)", color: "#000", border: "none", borderRadius: 8, padding: 12, cursor: "pointer", fontSize: 14, fontFamily: "inherit", fontWeight: 700, width: "100%" }}>
+          إضافة المهمة ✓
+        </button>
+        {debugMsg && (
+          <div style={{ background: "#0a1520", border: "1px solid #00d4ff44", borderRadius: 8, padding: "10px 14px", fontSize: 12, color: "#00d4ff", wordBreak: "break-all", lineHeight: 1.8 }}>
+            🔍 {debugMsg}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+//                       INITIAL DATA
+// ═══════════════════════════════════════════════════════════
+
+const INIT_TASKS = [];
+const INIT_HABITS = [];
+const INIT_PROFILE = { name: "", focusLevel: 70, energyLevel: 70, stressLevel: 30, productivityHours: "", avgFocusDuration: 45 };
+
+// ═══════════════════════════════════════════════════════════
+//                     MAIN COMPONENT
+// ═══════════════════════════════════════════════════════════
+
+export default function SmartPathEngine() {
+
+  const [profile, setProfile] = useState(INIT_PROFILE);
+  const [tasks, setTasks] = useState(INIT_TASKS);
+  const [habits, setHabits] = useState(INIT_HABITS);
+  const [view, setView] = useState("dashboard");
+  const [taskFilter, setTaskFilter] = useState("pending");
+  const [newHabit, setNewHabit] = useState("");
+  const [rec, setRec] = useState("");
+  const [loadingRec, setLoadingRec] = useState(false);
+
+  // Session state
+  const [plan, setPlan] = useState(null);
+  const [blockIdx, setBlockIdx] = useState(0);
+  const [timer, setTimer] = useState(null);
+  const [sessionHistory, setSessionHistory] = useState([]);
+  const [reflectOpen, setReflectOpen] = useState(false);
+  const [reflect, setReflect] = useState({ productivity: 4, completed: "yes" });
+  const [hours, setHours] = useState(3);
+  const [sessView, setSessView] = useState("planner");
+  const [loaded, setLoaded] = useState(false);
+
+  // Refs to avoid stale closures in effects
+  const prevSecsRef = useRef(null);
+  const planRef = useRef(plan);
+  const blockIdxRef = useRef(blockIdx);
+  planRef.current = plan;
+  blockIdxRef.current = blockIdx;
+
+  // Derived
+  const scored = tasks.map(t => ({ ...t, score: calcScore(t, profile) })).sort((a, b) => b.score - a.score);
+  const rules = getAdaptiveRules(profile, tasks);
+  const risk = burnoutRisk(profile);
+  const doneCount = tasks.filter(t => t.completed).length;
+  const pendingCount = tasks.filter(t => !t.completed).length;
+  const completionRate = tasks.length ? Math.round(doneCount / tasks.length * 100) : 0;
+  const topTask = scored.find(t => !t.completed);
+  const maxStreak = habits.length ? Math.max(...habits.map(h => h.streak)) : 0;
+  const insights = analyzeHistory(sessionHistory);
+
+  // Load from Firebase
+  useEffect(() => {
+    (async () => {
+      try {
+        const data = await loadData();
+        if (data) {
+          if (data.tasks)          setTasks(data.tasks);
+          if (data.habits)         setHabits(data.habits);
+          if (data.profile)        setProfile(data.profile);
+          if (data.sessionHistory) setSessionHistory(data.sessionHistory);
+        }
+      } catch (err) {
+        console.error("Load error:", err);
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  // Save to Firebase (debounced 1.5s to avoid excessive writes)
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => {
+      saveData({ tasks, habits, profile, sessionHistory });
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [tasks, habits, profile, sessionHistory, loaded]);
+
+  // Timer tick — recursive setTimeout (cleanest React pattern)
+  useEffect(() => {
+    if (!timer || timer.isPaused || timer.secondsLeft <= 0) return;
+    const id = setTimeout(() => {
+      setTimer(t => (t && !t.isPaused && t.secondsLeft > 0) ? { ...t, secondsLeft: t.secondsLeft - 1 } : t);
+    }, 1000);
+    return () => clearTimeout(id);
+  }, [timer]);
+
+  // Timer completion detection via prevSecsRef (avoids stale closures)
+  useEffect(() => {
+    if (timer?.secondsLeft === 0 && prevSecsRef.current > 0) {
+      if (timer.isBreak) {
+        const nextIdx = blockIdxRef.current + 1;
+        const p = planRef.current;
+        if (p && nextIdx < p.blocks.length) {
+          _activateBlock(p, nextIdx);
+        } else {
+          setTimer(null);
+        }
+      } else {
+        setReflectOpen(true);
+      }
+    }
+    prevSecsRef.current = timer?.secondsLeft ?? null;
+  }, [timer?.secondsLeft]); // eslint-disable-line
+
+  function _activateBlock(p, idx) {
+    if (!p || idx >= p.blocks.length) return;
+    const block = p.blocks[idx];
+    const secs = block.durationMin * 60;
+    setBlockIdx(idx);
+    prevSecsRef.current = secs;
+    setTimer({ secondsLeft: secs, totalSeconds: secs, isPaused: false, isBreak: false, interruptions: 0 });
+    setPlan(prev => prev ? { ...prev, blocks: prev.blocks.map((b, i) => ({ ...b, status: i === idx ? "active" : b.status })) } : prev);
+  }
+
+  // Task actions
+  const addTask = (task) => {
+    setTasks(p => [...p, { ...task, id: Date.now(), completed: false, postponeCount: 0, completionStreak: 0 }]);
+  };
+  const toggleTask = id => setTasks(p => p.map(t => t.id === id ? { ...t, completed: !t.completed } : t));
+  const postponeTask = id => setTasks(p => p.map(t => t.id === id ? { ...t, postponeCount: t.postponeCount + 1, urgency: Math.min(100, t.urgency + 10) } : t));
+  const deleteTask = id => setTasks(p => p.filter(t => t.id !== id));
+
+  // Habit actions
+  const toggleHabit = id => setHabits(p => p.map(h => h.id === id ? { ...h, done: !h.done, streak: !h.done ? h.streak + 1 : Math.max(0, h.streak - 1) } : h));
+  const addHabit = () => { if (!newHabit.trim()) return; setHabits(p => [...p, { id: Date.now(), name: newHabit, streak: 0, done: false, fails: 0 }]); setNewHabit(""); };
+  const deleteHabit = id => setHabits(p => p.filter(h => h.id !== id));
+
+  const setProfileKey = (key, val) => setProfile(p => ({ ...p, [key]: isNaN(val) ? val : +val }));
+
+  // Session actions
+  const buildNewPlan = () => { const p = buildPlan(tasks, profile, hours); setPlan(p); setBlockIdx(0); setTimer(null); prevSecsRef.current = null; };
+  const startBlock = idx => { if (plan) _activateBlock(plan, idx); };
+  const pauseTimer = () => setTimer(t => t ? { ...t, isPaused: !t.isPaused } : t);
+  const addInterruption = () => setTimer(t => t ? { ...t, interruptions: t.interruptions + 1 } : t);
+  const endEarly = () => setTimer(t => t && !t.isBreak ? { ...t, secondsLeft: 0, totalSeconds: Math.max(t.totalSeconds, 1) } : t);
+
+  const submitReflection = () => {
+    const block = planRef.current?.blocks[blockIdxRef.current];
+    if (!block) { setReflectOpen(false); return; }
+
+    const entry = { id: Date.now(), date: new Date().toISOString(), taskId: block.task.id, taskTitle: block.task.title, plannedMin: block.durationMin, productivity: reflect.productivity, completed: reflect.completed, interruptions: timer?.interruptions || 0, hour: new Date().getHours(), focusLevel: profile.focusLevel, energyLevel: profile.energyLevel };
+    setSessionHistory(p => [entry, ...p].slice(0, 100));
+
+    if (reflect.completed === "yes") toggleTask(block.task.id);
+    else if (reflect.completed === "partial") setTasks(p => p.map(t => t.id === block.task.id ? { ...t, estimatedMinutes: Math.max(15, t.estimatedMinutes - block.durationMin), completionStreak: t.completionStreak + 1 } : t));
+    else postponeTask(block.task.id);
+
+    setPlan(p => p ? { ...p, blocks: p.blocks.map((b, i) => i === blockIdxRef.current ? { ...b, status: "done" } : b) } : p);
+
+    // Adaptive learning: adjust session duration
+    if (reflect.productivity >= 4) setProfileKey("avgFocusDuration", Math.min(90, profile.avgFocusDuration + 2));
+    else if (reflect.productivity <= 2) setProfileKey("avgFocusDuration", Math.max(20, profile.avgFocusDuration - 3));
+
+    setReflectOpen(false);
+    setReflect({ productivity: 4, completed: "yes" });
+
+    const breakMin = block.breakMin;
+    const nextIdx = blockIdxRef.current + 1;
+    const currentPlan = planRef.current;
+    if (breakMin > 0 && currentPlan && nextIdx < currentPlan.blocks.length) {
+      const bSecs = breakMin * 60;
+      prevSecsRef.current = bSecs;
+      setTimer({ secondsLeft: bSecs, totalSeconds: bSecs, isPaused: false, isBreak: true, interruptions: 0 });
+      // blockIdx stays at DONE block → completion effect will do +1
+    } else if (currentPlan && nextIdx < currentPlan.blocks.length) {
+      _activateBlock(currentPlan, nextIdx);
+    } else {
+      setTimer(null);
+    }
+  };
+
+  const getAIRec = async () => {
+    setLoadingRec(true); setRec("");
+    const top5 = scored.filter(t => !t.completed).slice(0, 5);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514", max_tokens: 900,
+          messages: [{ role: "user", content: `أنت محرك SmartPath الذكي.\n\nالحالة: تركيز=${profile.focusLevel}% طاقة=${profile.energyLevel}% توتر=${profile.stressLevel}% إرهاق=${risk}%\n\nالمهام:\n${top5.map((t, i) => `${i + 1}. "${t.title}" نقاط=${t.score.toFixed(1)} صعوبة=${diffLabel(t.difficulty)} عاجل=${t.urgency}%`).join("\n")}\n\nالقواعد النشطة: ${rules.map(r => r.msg).join(" | ") || "مستقر"}\n\n**📌 المهمة الأمثل الآن:**\n[لماذا الآن بالذات — جملتان]\n\n**⚡ استراتيجية التنفيذ:**\n[تقنية + مدة مقترحة]\n\n**⚠️ تحذير SmartPath:**\n[إن وجد]\n\n**🔮 التنبؤ:**\n[احتمال الإنجاز + مستوى الإنتاجية المتوقع]\n\nبالعربية فقط.` }]
+        }),
+      });
+      const data = await res.json();
+      setRec((data.content || []).filter(b => b.type === "text").map(b => b.text).join("") || "لم يصل رد.");
+    } catch { setRec("❌ خطأ في الاتصال بمحرك AI"); }
+    setLoadingRec(false);
+  };
+
+  // ═══════════════════════════════════════════════════════════
+  //                         VIEWS
+  // ═══════════════════════════════════════════════════════════
+
+  function Dashboard() {
+    return (
+      <div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 16 }}>
+          <StatCard color={C.green} icon="✅" val={`${completionRate}%`} label="معدل الإنجاز" />
+          <StatCard color={risk > 60 ? C.red : risk > 40 ? C.orange : C.green} icon="🔥" val={`${risk}%`} label="خطر الإرهاق" />
+          <StatCard color={C.cyan} icon="📋" val={pendingCount} label="مهام معلقة" />
+          <StatCard color={C.purple} icon="🔥" val={`${maxStreak}د`} label="أطول سلسلة" />
+        </div>
+
+        {rules.length > 0 && (
+          <div style={S.card}>
+            <div style={S.cardTitle}>⚡ القواعد التكيفية النشطة</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+              {rules.map(r => <Badge key={r.id} sev={r.sev} icon={r.icon} msg={r.msg} />)}
+            </div>
+          </div>
+        )}
+
+        {topTask && (
+          <div style={{ ...S.card, borderColor: "#00d4ff33" }}>
+            <div style={S.cardTitle}>🎯 المهمة ذات الأولوية القصوى</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+              <div style={{ width: 50, height: 50, borderRadius: "50%", background: `conic-gradient(${scoreColor(topTask.score)} ${topTask.score * 3.6}deg, #1a2640 0deg)`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                <div style={{ width: 38, height: 38, borderRadius: "50%", background: C.card, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 900, color: scoreColor(topTask.score) }}>{topTask.score.toFixed(0)}</div>
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>{topTask.title}</div>
+                <div style={{ color: C.muted, fontSize: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <span>⏱ {topTask.estimatedMinutes}د</span><span>🎯 {diffLabel(topTask.difficulty)}</span><span>🔴 {topTask.urgency}%</span>
+                </div>
+              </div>
+              <Btn v="success" onClick={() => toggleTask(topTask.id)}>✓ إنجاز</Btn>
+            </div>
+          </div>
+        )}
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>📊 حالتك الذهنية والجسدية</div>
+          {[{ label: "التركيز", key: "focusLevel", color: C.cyan, icon: "🧠" }, { label: "الطاقة", key: "energyLevel", color: C.green, icon: "⚡" }, { label: "التوتر", key: "stressLevel", color: C.red, icon: "😤" }].map(m => (
+            <div key={m.key} style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 3 }}>
+                <span style={{ color: C.muted }}>{m.icon} {m.label}</span>
+                <span style={{ color: m.color, fontWeight: 700 }}>{profile[m.key]}%</span>
+              </div>
+              <Meter value={profile[m.key]} color={m.color} />
+            </div>
+          ))}
+        </div>
+
+        {insights && (
+          <div style={S.card}>
+            <div style={S.cardTitle}>📈 تحليل جلسات العمل</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10 }}>
+              <StatCard color={C.cyan} icon="⭐" val={`${insights.avgProd}/5`} label="متوسط الإنتاجية" />
+              <StatCard color={C.green} icon="✅" val={`${insights.completionRate}%`} label="معدل الإنجاز" />
+              <StatCard color={C.orange} icon="⚡" val={insights.avgInt} label="تشتت/جلسة" />
+              <StatCard color={C.purple} icon="⏱" val={insights.avgFocusActual ? `${insights.avgFocusActual}د` : "--"} label="تركيز فعلي" />
+            </div>
+          </div>
+        )}
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>🔄 العادات اليومية</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {habits.map(h => (
+              <div key={h.id} onClick={() => toggleHabit(h.id)} style={{ background: h.done ? "#00ff8815" : "#131c27", border: `1px solid ${h.done ? "#00ff8855" : C.border}`, borderRadius: 8, padding: "7px 12px", fontSize: 13, cursor: "pointer" }}>
+                {h.done ? "✅" : "⭕"} {h.name} <span style={{ color: C.orange, fontWeight: 700 }}>🔥{h.streak}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function SessionsView() {
+    const currentBlock = plan?.blocks[blockIdx];
+    const RADIUS = 72, CIRC = 2 * Math.PI * 72;
+    const dashOff = CIRC * (1 - (timer ? timer.secondsLeft / timer.totalSeconds : 1));
+    const fm = 0.7 + profile.focusLevel / 100 * 0.6;
+    const em = 0.8 + profile.energyLevel / 100 * 0.4;
+    const estLen = Math.round(Math.max(20, Math.min(90, profile.avgFocusDuration * fm * em)));
+    const estBreak = estLen >= 60 ? 15 : estLen >= 40 ? 10 : 5;
+
+    return (
+      <div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+          {[["planner", "⚡ المخطط"], ["history", `📈 السجل (${sessionHistory.length})`]].map(([id, label]) => (
+            <Btn key={id} v={sessView === id ? "primary" : "ghost"} style={{ fontSize: 12, padding: "6px 13px" }} onClick={() => setSessView(id)}>{label}</Btn>
+          ))}
+        </div>
+
+        {sessView === "planner" && <>
+          {/* ── Active Timer ── */}
+          {timer && currentBlock && (
+            <div style={{ ...S.card, textAlign: "center", borderColor: timer.isBreak ? "#00ff8855" : "#00d4ff55", background: "linear-gradient(160deg,#0a1520,#0d1a28)", position: "relative", overflow: "hidden" }}>
+              <div style={{ position: "absolute", top: -50, left: "50%", transform: "translateX(-50%)", width: 220, height: 220, borderRadius: "50%", background: timer.isBreak ? "#00ff880a" : "#00d4ff0a", filter: "blur(50px)", pointerEvents: "none" }} />
+              <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: 2, color: timer.isBreak ? C.green : C.cyan, marginBottom: 6, textTransform: "uppercase" }}>
+                {timer.isBreak ? "☕ وقت الراحة" : `🎯 جلسة عمل ${blockIdx + 1} / ${plan.blocks.length}`}
+              </div>
+              {!timer.isBreak && <div style={{ fontSize: 14, color: C.text, marginBottom: 10, fontWeight: 600 }}>{currentBlock.task.title}</div>}
+              {timer.isBreak && <div style={{ fontSize: 13, color: C.green, marginBottom: 10 }}>استرح — الجلسة القادمة تبدأ قريباً</div>}
+
+              {/* Circular Timer */}
+              <div style={{ position: "relative", display: "inline-block", marginBottom: 16 }}>
+                <svg width={168} height={168} style={{ transform: "rotate(-90deg)", display: "block" }}>
+                  <circle cx={84} cy={84} r={RADIUS} fill="none" stroke="#1a2640" strokeWidth={10} />
+                  <circle cx={84} cy={84} r={RADIUS} fill="none" stroke={timer.isBreak ? C.green : C.cyan} strokeWidth={10} strokeDasharray={CIRC} strokeDashoffset={dashOff} strokeLinecap="round" style={{ transition: "stroke-dashoffset 0.9s linear" }} />
+                </svg>
+                <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", textAlign: "center" }}>
+                  <div style={{ fontSize: 32, fontWeight: 900, color: timer.isBreak ? C.green : C.cyan, fontFamily: "monospace", letterSpacing: 2 }}>{fmt(timer.secondsLeft)}</div>
+                  <div style={{ fontSize: 11, color: C.muted }}>{timer.isPaused ? <span style={{ color: C.orange }}>⏸ موقوف</span> : timer.isBreak ? "استرح" : "دقيقة"}</div>
+                  {!timer.isBreak && timer.interruptions > 0 && <div style={{ fontSize: 11, color: C.orange }}>⚡ {timer.interruptions}</div>}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+                <Btn v="ghost" style={{ minWidth: 110 }} onClick={pauseTimer}>{timer.isPaused ? "▶ متابعة" : "⏸ إيقاف مؤقت"}</Btn>
+                {!timer.isBreak && <><Btn v="orange" onClick={addInterruption}>⚡ تشتّت</Btn><Btn v="cyan" onClick={endEarly}>✓ إنهاء مبكر</Btn></>}
+              </div>
+
+              {/* Progress dots */}
+              <div style={{ display: "flex", gap: 5, justifyContent: "center", marginTop: 14 }}>
+                {plan.blocks.map((b, i) => (
+                  <div key={i} style={{ width: i === blockIdx ? 22 : 8, height: 8, borderRadius: 4, background: b.status === "done" ? C.green : i === blockIdx ? C.cyan : "#1a2640", transition: "all 0.3s" }} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Plan Builder ── */}
+          {!plan && (
+            <div style={S.card}>
+              <div style={S.cardTitle}>📅 بناء خطة جلسات اليوم</div>
+              <div style={{ marginBottom: 18 }}>
+                <div style={{ fontSize: 13, color: C.muted, marginBottom: 8 }}>
+                  الوقت المتاح للعمل: <span style={{ fontSize: 19, fontWeight: 900, color: C.text }}>{hours}</span> <span style={{ color: C.muted }}>ساعة</span>
+                </div>
+                <input type="range" min={1} max={8} step={0.5} value={hours} style={S.slider} onChange={e => setHours(+e.target.value)} />
+              </div>
+              <div style={{ background: "#050d18", borderRadius: 10, padding: "14px 18px", marginBottom: 18, border: `1px solid ${C.border}` }}>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 2.5 }}>
+                  <div style={{ color: C.text, fontWeight: 700, marginBottom: 2, fontSize: 12 }}>⚙️ محاكاة الخوارزمية بحالتك الحالية:</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "0 20px" }}>
+                    <span>⏱ طول الجلسة المثلى</span><span style={{ color: C.cyan, fontWeight: 700 }}>{estLen} دقيقة</span>
+                    <span>☕ استراحة بعد كل جلسة</span><span style={{ color: C.green, fontWeight: 700 }}>{estBreak} دقيقة</span>
+                    <span>📋 جلسات متوقعة</span><span style={{ color: C.orange, fontWeight: 700 }}>{Math.floor(hours * 60 / (estLen + estBreak))} جلسات</span>
+                    <span>🎯 مهام جاهزة للجدولة</span><span style={{ color: C.purple, fontWeight: 700 }}>{pendingCount} مهمة</span>
+                  </div>
+                </div>
+              </div>
+              <Btn v="primary" style={{ width: "100%", padding: 14, fontSize: 15 }} onClick={buildNewPlan}>⚡ بناء الخطة الذكية</Btn>
+            </div>
+          )}
+
+          {/* ── Session Blocks ── */}
+          {plan && !timer && (
+            <div style={S.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                <div style={S.cardTitle}>📅 خطة اليوم الذكية</div>
+                <Btn v="ghost" style={{ fontSize: 11, padding: "4px 10px" }} onClick={() => { setPlan(null); setTimer(null); }}>↺ إعادة بناء</Btn>
+              </div>
+
+              {/* Timeline */}
+              <div style={{ display: "flex", gap: 2, height: 10, borderRadius: 5, overflow: "hidden", marginBottom: 14 }}>
+                {plan.blocks.map((b, i) => (
+                  <div key={i} style={{ flex: b.durationMin, background: b.status === "done" ? C.green : b.status === "active" ? C.cyan : "#1a2640", transition: "background 0.4s" }} />
+                ))}
+              </div>
+
+              <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.muted, marginBottom: 14, flexWrap: "wrap" }}>
+                <span>📦 {plan.blocks.length} جلسة</span>
+                <span>⏱ {plan.blocks.reduce((s, b) => s + b.durationMin, 0)}د عمل</span>
+                <span>⚡ جلسة = {plan.sessionLen}د</span>
+                <span>☕ استراحة = {plan.breakLen}د</span>
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {plan.blocks.map((block, i) => (
+                  <div key={block.id} style={{ background: block.status === "done" ? "#00ff8808" : "#131c27", border: `1px solid ${block.status === "done" ? "#00ff8833" : C.border}`, borderRadius: 9, padding: "12px 14px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div style={{ width: 30, height: 30, borderRadius: "50%", flexShrink: 0, background: block.status === "done" ? "#00ff8820" : "#1a2640", border: `2px solid ${block.status === "done" ? C.green : "#2a3a50"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: block.status === "done" ? C.green : C.muted, fontWeight: 900 }}>
+                        {block.status === "done" ? "✓" : i + 1}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: 13, color: block.status === "done" ? C.muted : C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{block.task.title}</div>
+                        <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+                          {block.durationMin}د • {diffLabel(block.task.difficulty)} • نقاط {block.task.score?.toFixed(1)}
+                          {block.breakMin > 0 && <span style={{ color: "#243240" }}> → استراحة {block.breakMin}د</span>}
+                        </div>
+                      </div>
+                      {block.status === "pending" && <Btn v="primary" style={{ fontSize: 12, padding: "6px 14px" }} onClick={() => startBlock(i)}>▶ ابدأ</Btn>}
+                      {block.status === "done" && <span style={{ color: C.green, fontSize: 18 }}>✓</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {plan.blocks.every(b => b.status === "done") && (
+                <div style={{ marginTop: 14, background: "#00ff8810", border: `1px solid ${C.green}44`, borderRadius: 10, padding: 16, textAlign: "center" }}>
+                  <div style={{ fontSize: 24, marginBottom: 4 }}>🎉</div>
+                  <div style={{ color: C.green, fontWeight: 700 }}>أنجزت جميع جلسات اليوم!</div>
+                  <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>SmartPath تكيّف مع هذا الأداء — الجلسات القادمة ستكون أدق</div>
+                </div>
+              )}
+            </div>
+          )}
+        </>}
+
+        {sessView === "history" && (
+          <div>
+            {insights ? (
+              <div style={S.card}>
+                <div style={S.cardTitle}>🧠 ما تعلّمه SmartPath عن أدائك</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 14 }}>
+                  <StatCard color={C.cyan} icon="⭐" val={`${insights.avgProd}/5`} label="متوسط الإنتاجية" />
+                  <StatCard color={C.green} icon="✅" val={`${insights.completionRate}%`} label="معدل الإنجاز" />
+                  <StatCard color={C.orange} icon="⚡" val={insights.avgInt} label="تشتت/جلسة" />
+                  <StatCard color={C.purple} icon="⏱" val={insights.avgFocusActual ? `${insights.avgFocusActual}د` : "--"} label="تركيز فعلي" />
+                </div>
+                {insights.hourAvgs.length > 0 && (
+                  <div style={{ background: "#050d18", borderRadius: 8, padding: "12px 16px", fontSize: 12, color: C.muted, lineHeight: 2.2 }}>
+                    🕐 أفضل ساعاتك للعمل:{" "}
+                    {insights.hourAvgs.map(h => <span key={h.hour} style={{ color: C.cyan, fontWeight: 700, marginLeft: 12 }}>الساعة {h.hour}:00 ({h.avg.toFixed(1)}⭐)</span>)}
+                  </div>
+                )}
+                {insights.avgFocusActual && Math.abs(insights.avgFocusActual - profile.avgFocusDuration) > 5 && (
+                  <div style={{ marginTop: 10, padding: "10px 14px", background: "#ffa50210", border: `1px solid ${C.orange}33`, borderRadius: 8, fontSize: 12, color: C.orange }}>
+                    💡 تركيزك الفعلي ({insights.avgFocusActual}د) يختلف عن الإعداد ({profile.avgFocusDuration}د). SmartPath يُعدّل تلقائياً بعد كل جلسة.
+                  </div>
+                )}
+              </div>
+            ) : sessionHistory.length > 0 ? (
+              <div style={{ ...S.card, textAlign: "center", color: C.muted, fontSize: 13 }}>أكمل 3 جلسات للحصول على التحليل السلوكي</div>
+            ) : null}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {sessionHistory.length === 0 ? (
+                <div style={{ textAlign: "center", color: C.muted, padding: 60 }}>
+                  <div style={{ fontSize: 40, marginBottom: 12 }}>📊</div>
+                  لا يوجد سجل جلسات بعد — ابدأ أول جلسة!
+                </div>
+              ) : sessionHistory.map(s => (
+                <div key={s.id} style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <div style={{ fontSize: 14, flexShrink: 0 }}>{"⭐".repeat(s.productivity)}{"☆".repeat(5 - s.productivity)}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.taskTitle}</div>
+                      <div style={{ fontSize: 11, color: C.muted, display: "flex", gap: 8, flexWrap: "wrap", marginTop: 2 }}>
+                        <span>{new Date(s.date).toLocaleDateString("ar-SA")}</span>
+                        <span>الساعة {s.hour}:00</span>
+                        <span>{s.plannedMin}د</span>
+                        <span>{s.completed === "yes" ? <span style={{ color: C.green }}>مكتمل ✓</span> : s.completed === "partial" ? <span style={{ color: C.orange }}>جزئي</span> : <span style={{ color: C.red }}>لم ينجز</span>}</span>
+                        {s.interruptions > 0 && <span style={{ color: C.orange }}>⚡ {s.interruptions} تشتت</span>}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function TasksView() {
+    const filt = taskFilter === "all" ? scored : taskFilter === "pending" ? scored.filter(t => !t.completed) : scored.filter(t => t.completed);
+    return (
+      <div>
+        <AddTaskForm onAdd={addTask} />
+
+        <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+          {[["all", `الكل (${tasks.length})`], ["pending", `معلقة (${pendingCount})`], ["completed", `منجزة (${doneCount})`]].map(([id, label]) => (
+            <Btn key={id} v={taskFilter === id ? "primary" : "ghost"} style={{ fontSize: 12, padding: "6px 13px" }} onClick={() => setTaskFilter(id)}>{label}</Btn>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+          {filt.map((task, idx) => (
+            <div key={task.id} style={{ ...S.card, marginBottom: 0, opacity: task.completed ? 0.55 : 1, borderColor: task.postponeCount >= 3 ? "#ffa50233" : task.urgency > 80 && !task.completed ? "#ff475722" : C.border, position: "relative" }}>
+              {!task.completed && idx < 3 && taskFilter !== "completed" && (
+                <div style={{ position: "absolute", top: 0, right: 0, background: `${[C.cyan, C.orange, C.muted][idx]}20`, borderRight: `3px solid ${[C.cyan, C.orange, C.muted][idx]}`, padding: "2px 8px", fontSize: 10, color: [C.cyan, C.orange, C.muted][idx], fontWeight: 900, borderRadius: "0 12px 0 6px" }}>#{idx + 1}</div>
+              )}
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 11, paddingTop: !task.completed && idx < 3 ? 6 : 0 }}>
+                <button onClick={() => toggleTask(task.id)} style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", flexShrink: 0 }}>{task.completed ? "✅" : "⭕"}</button>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4, textDecoration: task.completed ? "line-through" : "none", color: task.completed ? C.muted : C.text }}>
+                    {task.title}{task.postponeCount >= 3 && <span style={{ color: C.orange, fontSize: 11, marginRight: 8 }}>⚠️ ×{task.postponeCount}</span>}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, fontSize: 11, color: C.muted, flexWrap: "wrap" }}>
+                    <span>⏱ {task.estimatedMinutes}د</span><span>🎯 {diffLabel(task.difficulty)}</span><span>🔴 {task.urgency}%</span><span>⭐ {task.priority}%</span>
+                    {task.completionStreak > 0 && <span style={{ color: C.green }}>✨ ×{task.completionStreak}</span>}
+                  </div>
+                  <div style={{ ...S.meter, marginTop: 7 }}>
+                    <div style={{ height: "100%", width: `${Math.min(100, Math.max(0, task.score))}%`, background: scoreColor(task.score), borderRadius: 3, transition: "width 0.5s" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, flexShrink: 0 }}>
+                  <span style={{ background: `${scoreColor(task.score)}18`, border: `1px solid ${scoreColor(task.score)}44`, color: scoreColor(task.score), borderRadius: 20, padding: "3px 11px", fontSize: 12, fontWeight: 800 }}>{task.score.toFixed(1)}</span>
+                  {!task.completed && (
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <Btn v="ghost" style={{ padding: "5px 8px", fontSize: 13 }} onClick={() => postponeTask(task.id)}>⏸</Btn>
+                      <Btn v="danger" style={{ padding: "5px 8px", fontSize: 13 }} onClick={() => deleteTask(task.id)}>✕</Btn>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+          {filt.length === 0 && <div style={{ textAlign: "center", color: C.muted, padding: 48 }}>لا توجد مهام في هذا التصنيف</div>}
+        </div>
+      </div>
+    );
+  }
+
+  function AIView() {
+    return (
+      <div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>🤖 محرك التوصيات الذكي</div>
+          <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.8, marginBottom: 16 }}>يحلل SmartPath حالتك الآن ({profile.focusLevel}% تركيز، {profile.energyLevel}% طاقة) مع {pendingCount} مهمة معلقة ويولّد توصية مخصصة.</div>
+          <Btn v="primary" style={{ width: "100%", padding: 14, fontSize: 15 }} onClick={getAIRec} disabled={loadingRec}>{loadingRec ? "⏳ يحلل SmartPath بياناتك..." : "⚡ احصل على توصيتك الذكية"}</Btn>
+        </div>
+
+        {(rec || loadingRec) && (
+          <div style={S.card}>
+            <div style={S.cardTitle}>📡 تقرير SmartPath</div>
+            {loadingRec ? (
+              <div style={{ textAlign: "center", padding: 48, color: C.cyan }}><div style={{ fontSize: 40, marginBottom: 10 }}>🧠</div>الخوارزمية تحلل بياناتك...</div>
+            ) : (
+              <div style={{ background: "#050d18", border: `1px solid ${C.cyan}25`, borderRadius: 10, padding: 20, fontSize: 14, lineHeight: 2, whiteSpace: "pre-wrap", color: C.text }}>{rec}</div>
+            )}
+          </div>
+        )}
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>📐 معادلة الأولوية</div>
+          <div style={{ background: "#040a12", borderRadius: 8, padding: "14px 18px", fontFamily: "monospace", fontSize: 12, lineHeight: 2.2, color: C.cyan, border: `1px solid ${C.border}` }}>
+            <div style={{ color: "#2a3a50" }}>// حساب أولوية المهمة</div>
+            <div>score =</div>
+            {[["priority", "0.35"], ["urgency", "0.25"], ["focus_compat", "0.15"], ["goal_align", "0.15"], ["consistency", "0.10"]].map(([k, w]) => (
+              <div key={k} style={{ paddingRight: 20 }}> ({k} × <span style={{ color: C.green }}>{w}</span>) +</div>
+            ))}
+            <div style={{ paddingRight: 20 }}> (difficulty_penalty × <span style={{ color: C.red }}>0.10</span>)−</div>
+          </div>
+          <div style={{ marginTop: 10, fontSize: 12, color: C.muted, lineHeight: 2 }}>
+            ✦ focus_compat يتعكس تلقائياً حسب مستوى التركيز<br />
+            ✦ difficulty_penalty تتضاعف عند انخفاض الطاقة<br />
+            ✦ كل تأجيل يرفع urgency +10% تلقائياً
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function HabitsView() {
+    return (
+      <div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>➕ عادة جديدة</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input style={{ ...S.input, flex: 1 }} placeholder="اسم العادة..." value={newHabit} onChange={e => setNewHabit(e.target.value)} onKeyDown={e => e.key === "Enter" && addHabit()} />
+            <Btn v="success" onClick={addHabit}>إضافة</Btn>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginBottom: 14 }}>
+          <StatCard color={C.green} icon="✅" val={habits.filter(h => h.done).length} label={`منجز / ${habits.length}`} />
+          <StatCard color={C.orange} icon="🔥" val={maxStreak} label="أطول سلسلة" />
+          <StatCard color={C.cyan} icon="📊" val={habits.length ? `${Math.round(habits.filter(h => h.done).length / habits.length * 100)}%` : "0%"} label="معدل اليوم" />
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+          {habits.map(h => (
+            <div key={h.id} style={{ ...S.card, marginBottom: 0, borderColor: h.done ? "#00ff8833" : C.border }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <button onClick={() => toggleHabit(h.id)} style={{ background: "none", border: "none", fontSize: 24, cursor: "pointer" }}>{h.done ? "✅" : "⭕"}</button>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>{h.name}</div>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>فشل {h.fails}x • <span style={{ color: h.done ? C.green : C.muted }}>{h.done ? "منجز ✓" : "لم ينجز"}</span></div>
+                  <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
+                    {Array.from({ length: Math.min(21, h.streak + 2) }).map((_, i) => (
+                      <div key={i} style={{ width: 9, height: 9, borderRadius: 2, background: i < h.streak ? C.green : "#1a2640", opacity: i < h.streak ? 1 : 0.35 }} />
+                    ))}
+                    {h.streak > 21 && <span style={{ fontSize: 10, color: C.muted }}>+{h.streak - 21}</span>}
+                  </div>
+                </div>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 22 }}>🔥</div>
+                  <div style={{ fontWeight: 900, color: C.orange }}>{h.streak}</div>
+                  <div style={{ fontSize: 10, color: C.muted }}>يوم</div>
+                </div>
+                <Btn v="danger" style={{ padding: "5px 9px" }} onClick={() => deleteHabit(h.id)}>✕</Btn>
+              </div>
+            </div>
+          ))}
+          {habits.length === 0 && <div style={{ textAlign: "center", color: C.muted, padding: 48 }}>أضف أول عادة لك</div>}
+        </div>
+      </div>
+    );
+  }
+
+  function ProfileView() {
+    return (
+      <div>
+        <div style={S.card}>
+          <div style={S.cardTitle}>⚙️ ضبط حالتك الحالية</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+            {[
+              { label: "مستوى التركيز الذهني", key: "focusLevel", color: C.cyan, icon: "🧠", desc: "0 = لا تستطيع التركيز — 100 = في أفضل حالاتك" },
+              { label: "مستوى الطاقة الجسدية", key: "energyLevel", color: C.green, icon: "⚡", desc: "0 = منهك تماماً — 100 = نشيط للغاية" },
+              { label: "مستوى التوتر والضغط", key: "stressLevel", color: C.red, icon: "😤", desc: "0 = مرتاح تماماً — 100 = متوتر للغاية" },
+            ].map(f => (
+              <div key={f.key}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+                  <div>
+                    <div style={{ fontWeight: 700 }}>{f.icon} {f.label}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{f.desc}</div>
+                  </div>
+                  <span style={{ fontSize: 26, fontWeight: 900, color: f.color }}>{profile[f.key]}</span>
+                </div>
+                <input type="range" min={0} max={100} value={profile[f.key]} style={{ ...S.slider, accentColor: f.color }} onChange={e => setProfileKey(f.key, e.target.value)} />
+                <Meter value={profile[f.key]} color={f.color} />
+              </div>
+            ))}
+            <div>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>⏰ ساعات الإنتاجية الذروة</div>
+              <input style={S.input} value={profile.productivityHours} onChange={e => setProfileKey("productivityHours", e.target.value)} placeholder="مثال: 8م — 1ص" />
+            </div>
+            <div>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                🧘 مدة جلسة التركيز: <span style={{ color: C.cyan }}>{profile.avgFocusDuration} دقيقة</span>
+                <span style={{ fontSize: 11, color: C.muted, marginRight: 8 }}>(يُحدَّث تلقائياً)</span>
+              </div>
+              <input type="range" min={15} max={120} value={profile.avgFocusDuration} style={S.slider} onChange={e => setProfileKey("avgFocusDuration", e.target.value)} />
+            </div>
+          </div>
+        </div>
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>🧬 ملف السلوك الإنتاجي</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            {[
+              { label: "نمط التركيز", val: profile.focusLevel > 60 ? "تعمق طويل" : "جلسات قصيرة", color: C.cyan },
+              { label: "نوع الطاقة", val: profile.energyLevel > 60 ? "نشاط عالٍ" : "اقتصادي", color: C.green },
+              { label: "مستوى الانضباط", val: habits.filter(h => h.streak >= 7).length > 1 ? "منضبط جداً" : "في التطور", color: C.purple },
+              { label: "ضغط الأهداف", val: profile.stressLevel > 60 ? "ضغط زائد" : "متوازن", color: profile.stressLevel > 60 ? C.red : C.green },
+            ].map((p, i) => (
+              <div key={i} style={{ background: `${p.color}0f`, border: `1px solid ${p.color}33`, borderRadius: 9, padding: 12, textAlign: "center" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: p.color }}>{p.val}</div>
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{p.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 12, padding: "10px 14px", background: "#050d18", borderRadius: 8, fontSize: 12, color: C.muted, lineHeight: 1.8 }}>
+            💡 SmartPath يتعلم من كل جلسة. كلما زاد السجل، كلما دقّت التوصيات.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Reflection Modal ──
+  function ReflectionModal() {
+    return (
+      <div style={{ position: "fixed", inset: 0, background: "rgba(0,4,12,0.94)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, backdropFilter: "blur(6px)" }}>
+        <div style={{ background: "#0d1520", border: `1px solid ${C.cyan}55`, borderRadius: 16, padding: 28, maxWidth: 400, width: "90%", boxShadow: `0 0 60px ${C.cyan}15` }}>
+          <div style={{ fontSize: 17, fontWeight: 900, color: C.cyan, marginBottom: 4 }}>⚡ تقييم الجلسة</div>
+          <div style={{ fontSize: 11, color: C.muted, marginBottom: 22 }}>هذه البيانات تُغذّي خوارزمية التعلم وتحسّن الجلسات القادمة</div>
+
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 10, fontWeight: 600 }}>جودة التركيز خلال الجلسة</div>
+            <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>
+              {[1, 2, 3, 4, 5].map(n => (
+                <button key={n} onClick={() => setReflect(r => ({ ...r, productivity: n }))}
+                  style={{ background: "none", border: "none", fontSize: 34, cursor: "pointer", opacity: reflect.productivity >= n ? 1 : 0.2, transition: "opacity 0.15s" }}>⭐</button>
+              ))}
+            </div>
+            <div style={{ textAlign: "center", fontSize: 12, color: C.muted, marginTop: 5 }}>
+              {["", "مشتت جداً", "ضعيف", "متوسط", "جيد", "ممتاز 🚀"][reflect.productivity]}
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 10, fontWeight: 600 }}>هل أنجزت الجزء المخطط؟</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {[["yes", "✓ نعم", C.green], ["partial", "〜 جزئياً", C.orange], ["no", "✕ لا", C.red]].map(([v, label, color]) => (
+                <button key={v} onClick={() => setReflect(r => ({ ...r, completed: v }))}
+                  style={{ flex: 1, padding: "10px 4px", borderRadius: 9, cursor: "pointer", background: reflect.completed === v ? `${color}20` : "#131c27", border: `1px solid ${reflect.completed === v ? color : C.border}`, color: reflect.completed === v ? color : C.muted, fontFamily: "inherit", fontSize: 13, fontWeight: 600, transition: "all 0.2s" }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {reflect.productivity <= 2 && (
+            <div style={{ marginBottom: 14, padding: "10px 14px", background: "#ff475712", border: `1px solid ${C.red}33`, borderRadius: 8, fontSize: 12, color: C.red }}>
+              📉 SmartPath سيُقصّر جلساتك القادمة لتناسب تركيزك الفعلي
+            </div>
+          )}
+          {reflect.productivity >= 4 && (
+            <div style={{ marginBottom: 14, padding: "10px 14px", background: "#00ff8812", border: `1px solid ${C.green}33`, borderRadius: 8, fontSize: 12, color: C.green }}>
+              📈 SmartPath سيُطيل جلساتك تدريجياً بناءً على هذا الأداء
+            </div>
+          )}
+
+          <Btn v="primary" style={{ width: "100%", padding: 13, fontSize: 15 }} onClick={submitReflection}>حفظ وتابع ⚡</Btn>
+        </div>
+      </div>
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  //                        RENDER
+  // ═══════════════════════════════════════════════════════════
+
+  const VIEWS = { dashboard: Dashboard, sessions: SessionsView, tasks: TasksView, ai: AIView, habits: HabitsView, profile: ProfileView };
+  const V = VIEWS[view] || Dashboard;
+
+  const NAV = [
+    { id: "dashboard", icon: "📊", label: "لوحة القيادة" },
+    { id: "sessions", icon: "⚡", label: "جلسات العمل", live: !!timer },
+    { id: "tasks", icon: "📋", label: `المهام (${pendingCount})` },
+    { id: "ai", icon: "🤖", label: "محرك AI" },
+    { id: "habits", icon: "🔄", label: "العادات" },
+    { id: "profile", icon: "⚙️", label: "ملفي" },
+  ];
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", fontFamily: "'Cairo','Segoe UI',sans-serif", color: C.text, direction: "rtl", fontSize: 14 }}>
+
+      {/* Header */}
+      <div style={{ background: "linear-gradient(180deg,#0c1824,#07090f)", borderBottom: `1px solid ${C.border}`, padding: "11px 22px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 9, background: `linear-gradient(135deg,${C.cyan},${C.green})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>⚡</div>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 900, background: `linear-gradient(135deg,${C.cyan},${C.green})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>SmartPath Engine</div>
+            <div style={{ fontSize: 9, color: C.muted, letterSpacing: 0.5 }}>خوارزمية الإنتاجية التكيفية الذكية v2.0</div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+          {timer && !timer.isBreak && (
+            <div style={{ background: `${C.cyan}18`, border: `1px solid ${C.cyan}44`, borderRadius: 8, padding: "4px 11px", fontSize: 12, color: C.cyan, fontWeight: 800, fontFamily: "monospace" }}>🎯 {fmt(timer.secondsLeft)}</div>
+          )}
+          {timer?.isBreak && (
+            <div style={{ background: `${C.green}15`, border: `1px solid ${C.green}44`, borderRadius: 8, padding: "4px 11px", fontSize: 12, color: C.green, fontWeight: 800, fontFamily: "monospace" }}>☕ {fmt(timer.secondsLeft)}</div>
+          )}
+          {[{ icon: "🧠", key: "focusLevel", color: C.cyan }, { icon: "⚡", key: "energyLevel", color: C.green }, { icon: "😤", key: "stressLevel", color: C.red }].map(m => (
+            <div key={m.key} style={{ textAlign: "center" }}>
+              <div style={{ fontSize: 11, color: m.color, fontWeight: 700, marginBottom: 2 }}>{m.icon} {profile[m.key]}%</div>
+              <div style={{ background: "#131c27", borderRadius: 3, height: 4, overflow: "hidden", width: 60 }}>
+                <div style={{ height: "100%", width: `${profile[m.key]}%`, background: m.color, borderRadius: 3 }} />
+              </div>
+            </div>
+          ))}
+          {rules.length > 0 && <div style={{ background: "#ff475712", border: `1px solid #ff475744`, borderRadius: 7, padding: "4px 10px", fontSize: 11, color: C.red }}>⚠️ {rules.length}</div>}
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ display: "flex", height: "calc(100vh - 54px)" }}>
+
+        {/* Sidebar */}
+        <div style={{ width: 204, background: C.surface, borderLeft: `1px solid ${C.border}`, padding: "14px 10px", display: "flex", flexDirection: "column", gap: 3, flexShrink: 0, overflowY: "auto" }}>
+          {NAV.map(n => (
+            <button key={n.id} onClick={() => setView(n.id)}
+              style={{ background: view === n.id ? `linear-gradient(135deg,${C.cyan}18,${C.green}0d)` : "transparent", border: `1px solid ${view === n.id ? C.cyan + "44" : "transparent"}`, color: view === n.id ? C.cyan : C.muted, borderRadius: 8, padding: "9px 12px", cursor: "pointer", textAlign: "right", fontSize: 13, fontWeight: view === n.id ? 700 : 400, display: "flex", alignItems: "center", gap: 8, fontFamily: "inherit", width: "100%", transition: "all 0.18s" }}>
+              <span>{n.icon}</span>
+              <span style={{ flex: 1 }}>{n.label}</span>
+              {n.live && <div style={{ width: 7, height: 7, borderRadius: "50%", background: C.cyan, boxShadow: `0 0 6px ${C.cyan}` }} />}
+            </button>
+          ))}
+          <div style={{ marginTop: "auto", paddingTop: 20, fontSize: 9, color: "#1e2e44", textAlign: "center", lineHeight: 1.8 }}>SmartPath v2.0<br />Powered by Claude AI</div>
+        </div>
+
+        {/* Content */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "18px 22px" }}>
+          <div style={{ maxWidth: 820, margin: "0 auto" }}>
+            {V()}
+          </div>
+        </div>
+      </div>
+
+      {reflectOpen && <ReflectionModal />}
+    </div>
+  );
+}
