@@ -469,7 +469,7 @@ function SmartPathEngine() {
     setLoadingRec(true); setRec("");
     const top5 = scored.filter(t => !t.completed).slice(0, 5);
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("https://morning-sea-e6f0.alaa12mohmad.workers.dev", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514", max_tokens: 900,
